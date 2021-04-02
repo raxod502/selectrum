@@ -482,6 +482,15 @@ as symbol constituents.")
 (defvar selectrum--old-read-file-name-function nil
   "Previous value of `read-file-name-function'.")
 
+(defvar selectrum--static-tables '(help--symbol-completion-table)
+  "Tables which don't need dynamic computation.")
+
+(defvar selectrum--static-prompts '("M-x ")
+  "Prompts which don't need dynamic computation.")
+
+(defvar selectrum--static-commands '(insert-char)
+  "Commands which don't need dynamic computation.")
+
 ;;; Session state
 
 (defvar-local selectrum--history-hash nil
@@ -588,6 +597,17 @@ This is non-nil during the first call of
 
 ;;; Utility functions
 
+(defmacro selectrum--while-no-input (&rest body)
+  "Wrap BODY in `while-no-input' unless Selectrum is initializing.
+If input arrives and body is aborted return nil."
+  `(if selectrum--is-initializing
+       ,@body
+     ;; Without ignoring this event editing the input with M-DEL will
+     ;; not update the UI.
+     (let* ((while-no-input-ignore-events '(selection-request))
+            (res (while-no-input ,@body)))
+       (unless (eq t res) res))))
+
 (defun selectrum-refine-candidates-using-completions-styles (input candidates)
   "Use INPUT to filter and highlight CANDIDATES.
 Uses `completion-styles'."
@@ -682,6 +702,13 @@ function and BODY opens the minibuffer."
        (not (memq selectrum--match-is-required
                   '(confirm confirm-after-completion)))))
 
+(defun selectrum--treat-as-static-p (table cmd prompt)
+  "Determine if TABLE can be treated like a static one.
+CMD and PROMPT are the command and minibuffer prompt."
+  (or (memq table selectrum--static-tables)
+      (member prompt selectrum--static-prompts)
+      (memq cmd selectrum--static-commands)))
+
 (defun selectrum--normalize-collection (collection &optional predicate)
   "Normalize COLLECTION into a list of strings.
 COLLECTION may be a list of strings or symbols or cons cells, an
@@ -700,6 +727,19 @@ If PREDICATE is non-nil, then it filters the collection as in
                          (current-buffer))
     (let ((completion-regexp-list nil))
       (all-completions "" collection predicate))))
+
+(defun selectrum--dynamic-table-cands (input)
+  "Return dynamic table candidates for INPUT."
+  (nconc
+   (completion-all-completions
+    input
+    minibuffer-completion-table
+    minibuffer-completion-predicate
+    (length input)
+    (completion-metadata input
+                         minibuffer-completion-table
+                         minibuffer-completion-predicate))
+   nil))
 
 (defun selectrum--remove-default-from-prompt (prompt)
   "Remove the indication of the default value from PROMPT.
@@ -1127,15 +1167,12 @@ defaults to the current one and MAX which defaults to
       n)))
 
 (defun selectrum--preprocess (candidates)
-  "Preprocess CANDIDATES list.
-The preprocessing applies the `selectrum-preprocess-candidates-function'
-and the `x-group-function'."
+  "Preprocess CANDIDATES list."
   (setq-local selectrum--preprocessed-candidates
-              (funcall selectrum-preprocess-candidates-function
-                       candidates))
-  ;; Empty candidates are removed in default completion, as well.
-  (setq-local selectrum--preprocessed-candidates
-              (delete "" selectrum--preprocessed-candidates)))
+              ;; Empty candidates are removed in default completion,
+              ;; as well.
+              (delete "" (funcall selectrum-preprocess-candidates-function
+                                  candidates))))
 
 (defun selectrum--update-dynamic-candidates (input)
   "Update dynamic candidate set with new INPUT."
@@ -1145,9 +1182,8 @@ and the `x-group-function'."
            ;; Ensure dynamic functions won't
            ;; break in post command hook.
            (condition-case-unless-debug err
-               (funcall
-                selectrum--dynamic-candidates-function
-                input)
+               (funcall selectrum--dynamic-candidates-function
+                        input)
              (error (message (error-message-string err))
                     nil))))
       ;; Avoid modifying the returned
@@ -1248,7 +1284,9 @@ the update."
       (setq-local selectrum--last-input input)))
   (setq-local selectrum--previous-input-string input)
   (setq-local selectrum--virtual-input
-              (selectrum--update-dynamic-candidates input))
+              (or (selectrum--while-no-input
+                   (selectrum--update-dynamic-candidates input))
+                  input))
   (selectrum--update-refined-candidates selectrum--virtual-input)
   (setq-local selectrum--first-index-displayed nil)
   (setq-local selectrum--actual-num-candidates-displayed nil)
@@ -1833,6 +1871,18 @@ session was started from."
   ;; `selectrum-preprocess-candidates-function' for this session.
   (when-let ((sortf (selectrum--get-meta 'display-sort-function)))
     (setq-local selectrum-preprocess-candidates-function sortf))
+  ;; Handle dynamic tables which might need recomputation.
+  (when (and (not candidates)
+             (functionp minibuffer-completion-table)
+             (not (selectrum--treat-as-static-p
+                   minibuffer-completion-table
+                   this-command
+                   (minibuffer-prompt))))
+    (when (eq selectrum-refine-candidates-function
+              #'selectrum-refine-candidates-using-completions-styles)
+      (setq-local selectrum-refine-candidates-function
+                  #'selectrum-candidates-identity))
+    (setq candidates #'selectrum--dynamic-table-cands))
   (if (not (functionp candidates))
       (selectrum--preprocess candidates)
     (setq-local selectrum--preprocessed-candidates nil)
